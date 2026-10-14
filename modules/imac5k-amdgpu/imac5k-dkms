@@ -65,8 +65,11 @@ build() {
 }
 
 verify() {
-    local ko=$SERIES_DIR/amdgpu/amdgpu.ko vm
-    [[ -f $ko ]] || die "build produced no amdgpu.ko"
+    # DKMS has already signed, stripped, compressed and moved the module into its own module/ directory when this runs
+    # (argument 3); fall back to the build tree when called by hand. modinfo reads .ko.zst/.ko.xz directly.
+    local dir=${3:-$SERIES_DIR/amdgpu} ko vm
+    ko=$(compgen -G "$dir/amdgpu.ko*" | head -1 || true)
+    [[ -n $ko ]] || die "build produced no amdgpu.ko in $dir"
     vm=$(modinfo -F vermagic "$ko" | awk '{print $1}')
     [[ $vm == "$kernelver" ]] || die "module vermagic '$vm' != kernel '$kernelver'; refusing to install"
     modinfo -F parm "$ko" | grep -q '^tiled_stitch:' || die "built module has no tiled_stitch parameter; it is not the patched amdgpu"
@@ -85,7 +88,7 @@ post_install() {
 case ${1:-} in
     prepare) prepare ;;
     build) build "$@" ;;
-    verify) verify ;;
+    verify) verify "$@" ;;
     post-install) post_install ;;
     *) die "unknown step '${1:-}'" ;;
 esac

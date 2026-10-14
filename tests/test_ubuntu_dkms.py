@@ -37,6 +37,8 @@ class UbuntuDkmsTests(unittest.TestCase):
             self.assertIn(needle, conf)
         for step in ("prepare", "build", "verify", "post-install"):
             self.assertIn(f"imac5k-dkms {step}", conf)
+        # verify must look where DKMS leaves the module at POST_BUILD time, not in the build tree
+        self.assertIn("${kernelver}/${arch}/module", conf)
 
     def test_scripts_parse(self):
         for script in (MODULE / "imac5k-dkms", ROOT / "scripts" / "ubuntu-imac5k"):
