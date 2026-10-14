@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Ubuntu / Debian backend for the native-5K amdgpu patch, built on DKMS so the patched module follows kernel updates.
+#
+#   sudo scripts/ubuntu-imac5k install    register the DKMS package, build+install for every installed kernel
+#   sudo scripts/ubuntu-imac5k remove     undo all of it (stock amdgpu again after a reboot)
+#        scripts/ubuntu-imac5k status     read-only: what is installed, loaded and active
+#
+# Why DKMS: Arch/Fedora backends build once for the running kernel and say "re-run after a kernel update". Here every new
+# kernel package triggers `dkms autoinstall`, which fetches that kernel's exact Ubuntu source, re-applies the patch stack at
+# --fuzz=0 and rebuilds. If the stack no longer applies (amdgpu changed) the build fails, nothing is installed and that
+# kernel boots the stock module at 4K: an update can cost you 5K, never the display. See docs/ubuntu-dkms.md.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/lib/platform.sh"
+MODULE_SRC="$REPO/modules/imac5k-amdgpu"
+PKG=imac5k-amdgpu
+
+say()  { printf '==> %s\n' "$*"; }
+warn() { printf '!! %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+need_root() { [[ $EUID == 0 ]] || die "run with sudo: sudo $0 $*"; }
+
+# Every file that decides what gets built, so a changed patch means a new DKMS version (and a rebuild).
+stack_version() {
+    local f listed=()
+    mapfile -t listed < <(grep -vE '^\s*(#|$)' "$MODULE_SRC/patch-series.txt")
+    {
+        cat "$MODULE_SRC/dkms.conf" "$MODULE_SRC/imac5k-dkms" "$MODULE_SRC/patch-series.txt"
+        for f in "${listed[@]}"; do cat "$REPO/patches/$f"; [[ -f $REPO/patches/ports/7.0/$f ]] && cat "$REPO/patches/ports/7.0/$f"; done
+        for f in "$REPO"/patches/ports/*/*.patch; do [[ -f $f ]] && cat "$f"; done
+    } | sha256sum | cut -c1-12
+}
+
+dkms_versions() { dkms status 2>/dev/null | sed -n "s|^$PKG[/,] *\([^,:]*\).*|\1|p" | sort -u; }
+
+installed_kernels() {   # kernels with headers: the only ones DKMS can build for
+    local d; for d in /lib/modules/*/build; do [[ -e $d/Module.symvers ]] && basename "$(dirname "$d")"; done
+}
+
+preflight() {
+    ( . /etc/os-release; [[ ${ID:-} == ubuntu || ${ID:-} == debian || " ${ID_LIKE:-} " == *" debian "* || " ${ID_LIKE:-} " == *" ubuntu "* ]] ) ||
+        die "this backend is for Ubuntu/Debian (Arch: patch-imac5k-amdgpu.sh, Fedora: fedora-imac5k)"
+    imac_is_retina5k || die "not a Retina 5K iMac (detected: $(imac_product_name))"
+    imac_has_amdgpu || die "the 5K patch needs the amdgpu driver"
+    local t missing=()
+    for t in dkms patch tar bzip2 apt-get dpkg-deb make gcc pahole bc modinfo depmod; do command -v "$t" >/dev/null || missing+=("$t"); done
+    ((${#missing[@]} == 0)) || die "missing: ${missing[*]}  (sudo apt install dkms dwarves bc build-essential bzip2 patch)"
+    [[ -e /lib/modules/$(uname -r)/build/Module.symvers ]] || die "install linux-headers-$(uname -r) first"
+    local series; series=$(uname -r | cut -d. -f1-2)
+    grep -q "SUPPORTED_SERIES=\"[^\"]*\b${series//./\\.}\b" "$MODULE_SRC/imac5k-dkms" ||
+        die "kernel series $series is not one the patch stack is verified for; it needs a re-port (patches/README.md RULE 1)"
+    # A forced single-tile mode contradicts the stitched 5120x2880 panel.
+    if grep -rqsE 'video=eDP' /proc/cmdline /etc/default/grub /etc/default/grub.d/; then
+        die "a video=eDP-... parameter is set (4K fallback); remove it first, the stitched driver rejects a forced single-tile mode"
+    fi
+    [[ $(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo) -ge 4 ]] || warn "less than 4 GiB RAM available; the build is heavy"
+    local free; free=$(df --output=avail -BG /var/lib/dkms 2>/dev/null | tail -1 | tr -dc 0-9); (( ${free:-0} >= 6 )) || die "need 6 GiB free under /var/lib/dkms (have ${free:-?} GiB)"
+}
+
+install_pkg() {
+    need_root install
+    preflight
+    local ver src k failed=()
+    ver=ubuntu-$(stack_version); src=/usr/src/$PKG-$ver
+    # Replace older versions of this package.
+    for old in $(dkms_versions); do
+        [[ $old == "$ver" ]] || { say "removing older $PKG $old"; dkms remove "$PKG/$old" --all >/dev/null 2>&1 || true; rm -rf "/usr/src/$PKG-$old"; }
+    done
+    say "installing DKMS source $src"
+    rm -rf "$src"; mkdir -p "$src/patches"
+    cp -a --no-preserve=ownership "$MODULE_SRC/imac5k-dkms" "$MODULE_SRC/patch-series.txt" "$src/"
+    sed "s/@VERSION@/$ver/" "$MODULE_SRC/dkms.conf" > "$src/dkms.conf"
+    grep -vE '^\s*(#|$)' "$MODULE_SRC/patch-series.txt" | while read -r f; do cp -a --no-preserve=ownership "$REPO/patches/$f" "$src/patches/$f"; done
+    [[ -d $REPO/patches/ports ]] && cp -a --no-preserve=ownership "$REPO/patches/ports" "$src/patches/ports"
+    dkms status "$PKG/$ver" 2>/dev/null | grep -q . || dkms add "$PKG/$ver"
+    # One-time safety copy of the running kernel's initramfs; the post-install step rewrites it to carry the new module.
+    [[ -f /boot/initrd.img-$(uname -r) && ! -e /boot/initrd.img-$(uname -r).pre-imac5k ]] &&
+        { cp -a "/boot/initrd.img-$(uname -r)" "/boot/initrd.img-$(uname -r).pre-imac5k"; say "backup /boot/initrd.img-$(uname -r).pre-imac5k"; }
+    say "building for every installed kernel (about 5 minutes each on 4 cores)"
+    for k in $(installed_kernels); do
+        say "kernel $k"
+        if dkms install "$PKG/$ver" -k "$k" --force 2>&1 | tail -25; then :; fi
+        compgen -G "/lib/modules/$k/updates/dkms/amdgpu.ko*" >/dev/null || {
+            warn "no patched module was installed for $k (see /var/lib/dkms/$PKG/$ver/build/make.log); that kernel stays on stock amdgpu"
+            failed+=("$k"); }
+    done
+    if ((${#failed[@]})); then die "build failed for: ${failed[*]}. Nothing is active; the stock amdgpu still loads."; fi
+    cat <<DONE
+
+Installed $PKG $ver. Reboot to load the patched amdgpu: it stitches the two tiles into one 5120x2880 output on its own
+(amdgpu.tiled_stitch defaults to -1 = auto; 0 switches stitching off). New kernels are rebuilt automatically.
+Check: $0 status
+If the screen is wrong after the reboot: ssh in and run  sudo $0 remove && sudo reboot
+No network? At the GRUB menu (hold Esc or Shift) press e on the entry, append  nomodeset systemd.unit=multi-user.target,
+boot with Ctrl-x, log in on the text console and run the same remove command.
+DONE
+}
+
+remove_pkg() {
+    need_root remove
+    local v k
+    for v in $(dkms_versions); do say "removing $PKG $v from every kernel"; dkms remove "$PKG/$v" --all || true; rm -rf "/usr/src/$PKG-$v"; done
+    for k in $(installed_kernels); do
+        depmod "$k"
+        [[ -f /boot/initrd.img-$k ]] && command -v update-initramfs >/dev/null && update-initramfs -u -k "$k" 2>&1 | tail -1
+    done
+    say "removed. Reboot to run the stock amdgpu again."
+}
+
+status_pkg() {
+    local rc=0 ver k mod loaded stitched
+    ver=$(dkms_versions | tr '\n' ' '); echo "dkms package:   ${ver:-not registered}"
+    dkms status 2>/dev/null | grep "^$PKG" | sed 's/^/  /' || true
+    for k in $(installed_kernels); do
+        mod=$(compgen -G "/lib/modules/$k/updates/dkms/amdgpu.ko*" | head -1 || true)
+        if [[ -n $mod ]]; then printf 'kernel %-24s patched module installed\n' "$k"
+        else printf 'kernel %-24s STOCK amdgpu (no patched module)\n' "$k"; rc=1; fi
+    done
+    loaded=$(modinfo -n amdgpu 2>/dev/null || true)
+    echo "next boot loads: $loaded"
+    if [[ -r /sys/module/amdgpu/parameters/tiled_stitch ]]; then
+        stitched=$(cat /sys/module/amdgpu/parameters/tiled_stitch); echo "loaded amdgpu:  patched (tiled_stitch=$stitched)"
+    else echo "loaded amdgpu:  stock (no tiled_stitch parameter)"; rc=1; fi
+    imac_panel_has_stitched_mode && echo "panel:          5120x2880 offered" || { echo "panel:          5120x2880 NOT offered"; rc=1; }
+    return $rc
+}
+
+case "${1:-}" in
+    install|"")           install_pkg ;;
+    remove|--restore)     remove_pkg ;;
+    status)               status_pkg ;;
+    *) die "usage: $0 install|remove|status" ;;
+esac

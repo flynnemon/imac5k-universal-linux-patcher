@@ -23,6 +23,8 @@ Boot parameter once installed: `amdgpu.tiled_stitch=1`
 
 ## Installing without a second kernel
 
+**On Ubuntu/Debian**, `sudo ../scripts/ubuntu-imac5k install` registers a DKMS package instead, so the patched module is rebuilt for every kernel update; see [the Ubuntu guide](../docs/ubuntu-dkms.md). Series-specific ports of individual patches live in `patches/ports/<series>/` and replace the same-named patch for that series.
+
 **On Fedora KDE**, run `../scripts/imac-patcher --apply 5k` as your normal user
 instead. The Fedora backend builds from the matching Fedora source RPM and
 installs a module override through dracut and grubby; the Limine test-entry

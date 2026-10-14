@@ -1,0 +1,15 @@
+# Patch order for the "lean" stack; same set and order as scripts/patch-imac5k-amdgpu.sh (IMAC5K_STACK=lean).
+# A file under patches/ports/<kernel series>/ replaces the same-named file in patches/ for that series
+# (series 7.0 needs a re-anchored core patch, see patches/ports/7.0/).
+imac5k-lean-core-7.2.x.patch
+imac5k-stitch-layer-7.x.patch
+5k-going-down-stop-resync.patch
+5k-post-commit-link-recovery.patch
+5k-logical-modeset-guard.patch
+5k-resume-drop-cached-peer.patch
+5k-resume-arm-link-health.patch
+imacpro-slave-dp-panel-mode.patch
+dce120-enable-crtc-reset.patch
+dce12-multisync-master-first.patch
+dce110-genlock-master-from-pipe0.patch
+5k-resync-postpone-on-modeset.patch

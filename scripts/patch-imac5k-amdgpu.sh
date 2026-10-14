@@ -32,6 +32,15 @@ source "${SCRIPT_DIR}/lib/platform.sh"
 if imac_is_fedora; then
     exec "${SCRIPT_DIR}/fedora-imac5k" "$@"
 fi
+if imac_is_debian_family && ! imac_is_arch; then
+    # Ubuntu/Debian: DKMS rebuilds the patched module for every kernel. The installer's own verbs are
+    # install/remove/status; this script's historical no-argument and --restore forms map onto them.
+    case "${1:-}" in
+        ""|install) exec "${SCRIPT_DIR}/ubuntu-imac5k" install ;;
+        --restore)  exec "${SCRIPT_DIR}/ubuntu-imac5k" remove ;;
+        *)          exec "${SCRIPT_DIR}/ubuntu-imac5k" "$@" ;;
+    esac
+fi
 # Two Arch-family backends: Limine (Omarchy) and GRUB. GRUB edits the cmdline
 # in /etc/default/grub + grub-mkconfig instead of limine-entry-tool drop-ins.
 GRUB=0

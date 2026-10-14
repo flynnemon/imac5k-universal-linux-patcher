@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# DKMS build steps for imac5k-amdgpu. Called from dkms.conf as root, inside the DKMS build directory:
+#   prepare <kernelver>               fetch the matching Ubuntu kernel source, extract amdgpu, apply the patch stack
+#   build <kernelver> <kernel_source> compile only the amdgpu module against that kernel's headers
+#   verify <kernelver>                refuse a module that does not match the kernel or is not the patched one
+#   post-install <kernelver>          make the kernel's initramfs carry the module that was just installed
+# Any failure leaves the stock module in place: DKMS installs nothing, the machine boots at 4K.
+set -euo pipefail
+SUPPORTED_SERIES="7.0 7.1 7.2"      # series the stack is known to apply to (patches/README.md RULE 1)
+SERIES_DIR=drivers/gpu/drm/amd
+say() { echo "imac5k-dkms: $*"; }
+die() { echo "imac5k-dkms: ERROR: $*" >&2; exit 1; }
+
+kernelver=${2:-}; [[ -n $kernelver ]] || die "usage: $0 <step> <kernelver> [kernel_source_dir]"
+upstream=${kernelver%%-*}                       # 7.0.0-38-generic -> 7.0.0
+series=$(cut -d. -f1-2 <<<"$upstream")          # 7.0
+
+prepare() {
+    [[ " $SUPPORTED_SERIES " == *" $series "* ]] ||
+        die "kernel $kernelver is series $series; the patch stack is verified for: $SUPPORTED_SERIES. It needs a human re-port first, nothing was built."
+    command -v patch >/dev/null || die "patch is not installed"
+    rm -rf drivers include .imac5k-*
+    # The exact source of the running kernel, from the same Ubuntu archive. The headers package has the kernel's
+    # version (e.g. 7.0.0-38.38); linux-source-<upstream> carries the same version for the same build.
+    local srcpkg=linux-source-$upstream srcver deb tmp
+    srcver=$(dpkg-query -W -f='${Version}' "linux-headers-$kernelver" 2>/dev/null) || die "linux-headers-$kernelver is not installed"
+    tmp=$(mktemp -d); trap "rm -rf '$tmp'" EXIT       # expanded now: $tmp is gone when the trap runs
+    if [[ $(dpkg-query -W -f='${Version}' "$srcpkg" 2>/dev/null || true) == "$srcver" ]]; then
+        deb=
+        say "using the installed $srcpkg $srcver"
+        tar -xj --no-same-owner --strip-components=1 -f "/usr/src/$srcpkg.tar.bz2" --wildcards "*/$SERIES_DIR/*" '*/include/trace/*' || true
+    else
+        say "downloading $srcpkg=$srcver"
+        (cd "$tmp" && apt-get download "$srcpkg=$srcver" >/dev/null) || die "cannot download $srcpkg=$srcver (not in the archive any more? install that kernel's source by hand)"
+        deb=$(ls "$tmp"/${srcpkg}_*.deb)
+        # (/usr/src/<pkg>.tar.bz2 inside the .deb is a symlink; the file is /usr/src/<pkg>/<pkg>.tar.bz2)
+        dpkg-deb --fsys-tarfile "$deb" | tar -xO "./usr/src/$srcpkg/$srcpkg.tar.bz2" |
+            tar -xj --no-same-owner --strip-components=1 --wildcards "*/$SERIES_DIR/*" '*/include/trace/*' || true
+    fi
+    [[ -f $SERIES_DIR/amdgpu/Makefile ]] || die "amdgpu source was not extracted from $srcpkg $srcver"
+    echo "$srcpkg $srcver" > .imac5k-source
+
+    local f src sum=
+    while read -r f; do
+        [[ -z $f || $f == \#* ]] && continue
+        src=patches/$f; [[ -f patches/ports/$series/$f ]] && src=patches/ports/$series/$f
+        [[ -f $src ]] || die "missing patch $f"
+        patch -p1 --batch --forward --fuzz=0 --dry-run < "$src" >/dev/null 2>&1 ||
+            die "$f does not apply to $srcpkg $srcver (amdgpu changed; this kernel needs a re-port). Nothing was built."
+        patch -p1 --batch --forward --fuzz=0 --no-backup-if-mismatch < "$src" >/dev/null
+        sum+=$(sha256sum "$src" | cut -c1-12)
+        say "applied $src"
+    done < patch-series.txt
+    sha256sum <<<"$sum" | cut -c1-16 > .imac5k-stack
+}
+
+build() {
+    local ksrc=${3:-}; [[ -d $ksrc ]] || die "kernel build directory '$ksrc' does not exist"
+    local args=()
+    grep -qx 'CONFIG_CC_IS_CLANG=y' "$ksrc/.config" 2>/dev/null && args+=(LLVM=1)
+    command -v pahole >/dev/null || say "warning: pahole missing; the module will have no BTF (install dwarves)"
+    say "compiling amdgpu for $kernelver (about 15 minutes)"
+    nice -n 15 ionice -c3 make -C "$ksrc" -j"$(nproc)" "${args[@]}" \
+        M="$PWD/$SERIES_DIR/amdgpu" "CFLAGS_amdgpu_trace_points.o=-I$PWD/include/trace" modules
+}
+
+verify() {
+    local ko=$SERIES_DIR/amdgpu/amdgpu.ko vm
+    [[ -f $ko ]] || die "build produced no amdgpu.ko"
+    vm=$(modinfo -F vermagic "$ko" | awk '{print $1}')
+    [[ $vm == "$kernelver" ]] || die "module vermagic '$vm' != kernel '$kernelver'; refusing to install"
+    modinfo -F parm "$ko" | grep -q '^tiled_stitch:' || die "built module has no tiled_stitch parameter; it is not the patched amdgpu"
+    say "verified: $(cat .imac5k-source), stack $(cat .imac5k-stack), vermagic $vm"
+}
+
+post_install() {
+    # Whatever builds the initramfs (dracut here) may already have run for this kernel without our module; if so,
+    # rebuild it so the patched amdgpu is the one that loads. If the image is not there yet, its own hook will do it.
+    if [[ -f /boot/initrd.img-$kernelver ]] && command -v update-initramfs >/dev/null; then
+        say "regenerating the initramfs for $kernelver"
+        update-initramfs -u -k "$kernelver" || say "warning: initramfs regeneration failed; run: update-initramfs -u -k $kernelver"
+    fi
+}
+
+case ${1:-} in
+    prepare) prepare ;;
+    build) build "$@" ;;
+    verify) verify ;;
+    post-install) post_install ;;
+    *) die "unknown step '${1:-}'" ;;
+esac

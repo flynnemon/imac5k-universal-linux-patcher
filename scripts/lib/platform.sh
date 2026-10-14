@@ -52,6 +52,8 @@ imac_panel_needs_10bpc() { [[ ${product:-$(imac_product_name)} == iMacPro1,1 ]];
 
 imac_is_fedora() { ( [[ -r /etc/os-release ]] && . /etc/os-release; [[ ${ID:-} == fedora ]] ); }
 imac_is_arch() { ( [[ -r /etc/os-release ]] && . /etc/os-release; [[ ${ID:-} == arch || ${ID:-} == archlinux || " ${ID_LIKE:-} " == *" arch "* || " ${ID_LIKE:-} " == *" archlinux "* ]] ); }
+# Ubuntu and Debian derivatives. The 5K backend for them is DKMS (scripts/ubuntu-imac5k).
+imac_is_debian_family() { ( [[ -r /etc/os-release ]] && . /etc/os-release; [[ ${ID:-} == ubuntu || ${ID:-} == debian || " ${ID_LIKE:-} " == *" debian "* || " ${ID_LIKE:-} " == *" ubuntu "* ]] ); }
 imac_is_atomic() { [[ -e /run/ostree-booted ]]; }
 imac_is_kde() { local desktop=${XDG_CURRENT_DESKTOP:-}; [[ ${desktop,,} == *kde* ]]; }
 # Bootloaders are identified by the configs they maintain, never by installed
